@@ -84,7 +84,7 @@ func (user *User) loginWithSharedSecret() error {
 }
 
 func (user *User) newDoublePuppetIntent() (*appservice.IntentAPI, error) {
-	client, err := mautrix.NewClient(user.bridge.Config.Bridge.DoublePuppetServerURL, user.MXID, user.AccessToken)
+	client, err := mautrix.NewClient(user.bridge.Config.Bridge.DoublePuppetServerURL, user.MXID, user.bridge.Config.AppService.ASToken)
 	if err != nil {
 		return nil, err
 	}
