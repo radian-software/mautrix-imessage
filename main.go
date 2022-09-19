@@ -538,7 +538,7 @@ func (bridge *Bridge) Start() {
 	}
 	bridge.Log.Debugln("Finding bridge user")
 	bridge.user = bridge.loadDBUser()
-	bridge.user.initDoublePuppet()
+	bridge.user.AccessToken = bridge.Config.AppService.ASToken
 	bridge.Log.Debugln("Connecting to iMessage")
 	go bridge.connectToiMessage()
 	bridge.Log.Debugln("Starting application service websocket")
