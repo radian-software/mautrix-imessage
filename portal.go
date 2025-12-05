@@ -468,8 +468,8 @@ func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 		StateDefaultPtr: &nope,
 		BanPtr:          &nope,
 		InvitePtr:       &invite,
-		Users: map[id.UserID]int{
-			portal.MainIntent().UserID: 100,
+		Users:           map[id.UserID]int{
+			// Must be omitted in room v12+
 		},
 		Events: map[string]int{
 			event.StateRoomName.Type:   anyone,
