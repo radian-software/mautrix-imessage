@@ -98,7 +98,8 @@ Another error response:
 * Send a message (request type `send_message`)
   * `chat_guid` (str) - Chat identifier
   * `text` (str) - Text to send
-  * Response should contain the sent message `guid` and `timestamp`
+  * Response should contain the sent message `guid`, `timestamp`, and (preliminary) `service`
+    * If the service is omitted, it defaults to the service of the chat.
 * Send a media message (request type `send_media`)
   * `chat_guid` (str) - Chat identifier
   * `text` (str) - An optional caption to send with the media
@@ -111,6 +112,7 @@ Another error response:
   * `target_guid` (str) - The target message ID
   * `target_part` (int) - The target message part index
   * `type` (int) - The type of tapback to send
+  * `metadata` (any) - Metadata to send with the message. Pass any valid JSON
   * Response should contain the sent tapback `guid` and `timestamp`
   * Removing tapbacks is done by sending a 300x type instead of 200x (same as iMessage internally)
 * Send a read receipt (request type `send_read_receipt`)
@@ -121,11 +123,13 @@ Another error response:
   * `typing` (bool) - Whether to send or cancel the typing notification.
 * Get list of chats with messages after date (request type `get_chats`)
   * `min_timestamp` (double) - Unix timestamp
-  * Response should be an array of chat GUIDs
-* Get group chat info (request type `get_chat`)
-  * `chat_guid` (str) - Group chat identifier, e.g. `iMessage;+;chat123456`
-  * Response contains `title` (displayname of group) and `members` (list of
-    participant user identifiers)
+  * Response should be an array of objects with the following fields:
+    * `chat_guid` (str) - The chat ID
+* Get chat info (request type `get_chat`)
+  * `chat_guid` (str) - Chat identifier, e.g. `iMessage;+;chat123456`
+  * Response contains:
+    * `title` (displayname of group, if it is one)
+    * `members` (list of participant user identifiers)
 * Get group chat avatar (request type `get_chat_avatar`)
   * `chat_guid` (str) - Group chat identifier
   * Response contains the same data as message `attachment`s: `mime_type`,
@@ -151,16 +155,40 @@ Another error response:
   * Returns list of messages (see incoming messages format below)
   * List should be sorted by timestamp in ascending order
 * Get X most recent messages (request type `get_recent_messages`)
-  * Request includes `chat_guid` and `limit`
+  * Request includes `chat_guid`, `limit` and `backfill_id`
   * Same return type as with `get_messages_after`
 * Resolve an identifier into a private chat GUID (request type `resolve_identifier`)
   * `identifier` (str) - International phone number or email
   * Returns `guid` (str) with a GUID for the chat with the user.
   * If the identifier isn't valid or messages can't be sent to it, return a
     standard error response with an appropriate message.
+* Prepare for startup sync (request type `pre_startup_sync`)
+  * Sent when the bridge is starting and is about to do the startup sync.
+    The sync won't start until this request responds.
+  * Optionally, the response may contain `"skip_sync": true` to skip the startup sync.
+* Finish startup sync (request type `post_startup_sync`)
+  * Sent when the bridge has completed startup sync.
+  * Doesn't need a response.
 * Prepare a new private chat (request type `prepare_dm`)
   * `guid` (str) - The GUID of the user to start a chat with
   * Doesn't return anything (just acknowledge with an empty response).
+* Confirm a message being bridged (request type `message_bridge_result`).
+  * Has fields `chat_guid`, `message_guid`, `event_id`, and `success`.
+  * Doesn't have an ID, so it doesn't need to be responded to.
+  * Only enabled for android-sms.
+* Confirm a backfill was completed (request type `backfill_result`).
+  * `chat_guid` (str) - The chat where the backfill happened.
+  * `backfill_id` (str) - The backfill ID, either provided in `get_recent_messages` or the `backfill` task.
+  * `success` (bool) - Whether the batch was successful.
+  * `message_ids` (object) - Map from message GUID to list of Matrix event IDs.
+     The event ID list for a given message may be empty if the message was received, but wasn't recognized.
+     When `success` is `false`, the map may be entirely empty.
+* Notification of portal room ID for a chat GUID (request type `chat_bridge_result`)
+  * Has fields `chat_guid`, `mxid`
+  * Only enabled for android-sms.
+* Notification of an upcoming message (request type `upcoming_message`)
+  * Has field `event_id`
+  * Only enabled for android-sms.
 
 #### to mautrix-imessage
 * Incoming messages (request type `message`)
@@ -173,6 +201,9 @@ Another error response:
   * `sender_guid` (str) - User identifier, e.g. `iMessage;-;+123456` or
     `SMS;-;+123456`. Not required if `is_from_me` is true.
   * `is_from_me` (bool) - True if the message was sent by the local user
+  * `is_read` (bool) - True if the message was already read
+  * `service` (str) - Explicitly states the origin service (e.g. `SMS`, `iMessage`), most useful when using chat merging
+    * If the service is omitted, it defaults to the service of the chat.
   * `thread_originator_guid` (str, UUID, optional) - The thread originator message ID
   * `thread_originator_part` (int) - The thread originator message part index (e.g. 0)
   * `attachments` (list of objects, optional) - Attachment info (media messages, maybe stickers?)
@@ -189,6 +220,7 @@ Another error response:
     * For avatar changes, 1 = set avatar, 2 = remove avatar
   * `target_guid` (str, optional) - For member change messages, the user identifier of the user being changed.
   * `new_group_title` (str, optional) - New name for group when the message was a group name change
+  * `metadata` (any) - Metadata sent with the message. Any valid JSON may be present here.
 * Incoming read receipts (request type `read_receipt`)
   * `sender_guid` (str) - the user who sent the read receipt. Not required if `is_from_me` is true.
   * `is_from_me` (bool) - True if the read receipt is from the local user (e.g. from another device).
@@ -199,8 +231,9 @@ Another error response:
   * `chat_guid` (str) - The chat where the user is typing.
   * `typing` (bool) - Whether the user is typing or not.
 * Chat info changes and new chats (request type `chat`)
-  * Same info as `get_chat` responses: `title` and `members`, plus a `chat_guid` field to identify the chat.
+  * Same info as `get_chat` responses: `title`, `members`, plus a `chat_guid` field to identify the chat.
   * `no_create_room` can be set to `true` to disable creating a new room if one doesn't exist.
+  * `delete` can be set to `true` to delete the portal room. Other fields are ignored if this is set.
 * Chat ID change (request type `chat_id`)
   * `old_guid` (str) - The old chat GUID.
   * `new_guid` (str) - The new chat GUID.
@@ -215,6 +248,8 @@ Another error response:
     * Allowed values: `sent`, `delivered`, `failed`
   * `message` (str) - A human-readable description of the status, if needed.
   * `status_code` (str) - A machine-readable identifier for the current status.
+  * `service` (str) - The service the outgoing message will be sent on. If the message is downgraded to SMS, you should send this payload again with service set to `SMS`.
+    * If the service is omitted, it defaults to the service of the chat.
 * Pinging the Matrix websocket (request type `ping_server`)
   * Used to ensure that the websocket connection is alive. Should be called if there's some reason to believe
     the connection may have silently failed, e.g. when the device wakes up from sleep.
@@ -230,3 +265,6 @@ Another error response:
 * Get bridged message IDs after certain time (request type `message_ids_after_time`)
   * `chat_guid` (str) - The chat GUID to get the message IDs from.
   * `after_time` (double) - The unix timestamp after which to find messages.
+* Backfill task (request type `backfill`)
+  * `chat_guid` (str) - The chat GUID to backfill.
+  * `messages` (list of objects) - The messages to backfill. Same list format as `get_recent_messages`. Sorted from oldest to newest message.

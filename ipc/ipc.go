@@ -19,12 +19,14 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	log "maunium.net/go/maulogger/v2"
 )
@@ -35,10 +37,12 @@ const (
 )
 
 var (
+	ErrIPCTimeout        = errors.New("ipc request timeout")
 	ErrUnknownCommand    = Error{"unknown-command", "Unknown command"}
 	ErrSizeLimitExceeded = Error{Code: "size_limit_exceeded"}
 	ErrTimeoutError      = Error{Code: "timeout"}
 	ErrUnsupportedError  = Error{Code: "unsupported"}
+	ErrNotFound          = Error{Code: "not_found"}
 )
 
 type Command string
@@ -67,7 +71,11 @@ func (err Error) Error() string {
 func (err Error) Is(other error) bool {
 	otherErr, ok := other.(Error)
 	if !ok {
-		return false
+		otherErrPtr, ok := other.(*Error)
+		if !ok || otherErrPtr == nil {
+			return false
+		}
+		otherErr = *otherErrPtr
 	}
 	return otherErr.Code == err.Code
 }
@@ -76,7 +84,7 @@ type HandlerFunc func(message json.RawMessage) interface{}
 
 type Processor struct {
 	log    log.Logger
-	lock   *sync.Mutex
+	lock   sync.Mutex
 	stdout *json.Encoder
 	stdin  *json.Decoder
 
@@ -88,9 +96,8 @@ type Processor struct {
 	printPayloadContent bool
 }
 
-func newProcessor(lock *sync.Mutex, output io.Writer, input io.Reader, logger log.Logger, printPayloadContent bool) *Processor {
+func newProcessor(output io.Writer, input io.Reader, logger log.Logger, printPayloadContent bool) *Processor {
 	return &Processor{
-		lock:                lock,
 		log:                 logger,
 		stdout:              json.NewEncoder(output),
 		stdin:               json.NewDecoder(input),
@@ -101,11 +108,11 @@ func newProcessor(lock *sync.Mutex, output io.Writer, input io.Reader, logger lo
 }
 
 func NewCustomProcessor(output io.Writer, input io.Reader, logger log.Logger, printPayloadContent bool) *Processor {
-	return newProcessor(&sync.Mutex{}, output, input, logger.Sub("IPC"), printPayloadContent)
+	return newProcessor(output, input, logger.Sub("IPC"), printPayloadContent)
 }
 
 func NewStdioProcessor(logger log.Logger, printPayloadContent bool) *Processor {
-	return newProcessor(&logger.(*log.BasicLogger).StdoutLock, os.Stdout, os.Stdin, logger.Sub("IPC"), printPayloadContent)
+	return newProcessor(os.Stdout, os.Stdin, logger.Sub("IPC"), printPayloadContent)
 }
 
 func (ipc *Processor) Loop() {
@@ -139,7 +146,7 @@ func (ipc *Processor) Loop() {
 			ipc.waiterLock.Lock()
 			waiter, ok := ipc.waiters[msg.ID]
 			if !ok {
-				ipc.log.Warnln("Nothing waiting for IPC response to %d", msg.ID)
+				ipc.log.Warnfln("Nothing waiting for IPC response to %d", msg.ID)
 			} else {
 				delete(ipc.waiters, msg.ID)
 				waiter <- &msg
@@ -163,48 +170,54 @@ func (ipc *Processor) Send(cmd Command, data interface{}) error {
 	return err
 }
 
-func (ipc *Processor) RequestAsync(cmd Command, data interface{}) (<-chan *Message, error) {
+func (ipc *Processor) RequestAsync(cmd Command, data interface{}) (<-chan *Message, int, error) {
 	respChan := make(chan *Message, 1)
 	reqID := int(atomic.AddInt32(&ipc.reqID, 1))
 	ipc.waiterLock.Lock()
 	ipc.waiters[reqID] = respChan
 	ipc.waiterLock.Unlock()
+	ipc.log.Debugfln("Sending IPC command: %s/%d", cmd, reqID)
 	ipc.lock.Lock()
 	err := ipc.stdout.Encode(OutgoingMessage{Command: cmd, ID: reqID, Data: data})
 	ipc.lock.Unlock()
 	if err != nil {
-		ipc.waiterLock.Lock()
-		delete(ipc.waiters, reqID)
-		ipc.waiterLock.Unlock()
-		close(respChan)
+		panic(fmt.Errorf("error sending IPC command: %w", err))
 	}
-	return respChan, err
+	return respChan, reqID, err
 }
 
 func (ipc *Processor) Request(ctx context.Context, cmd Command, reqData interface{}, respData interface{}) error {
-	respChan, err := ipc.RequestAsync(cmd, reqData)
+	respChan, reqID, err := ipc.RequestAsync(cmd, reqData)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
-	select {
-	case rawData := <-respChan:
-		if rawData.Command == "error" {
-			var respErr Error
-			err = json.Unmarshal(rawData.Data, &respErr)
-			if err != nil {
-				return fmt.Errorf("failed to parse error response: %w", err)
+	hardTimeout := time.After(5 * time.Minute)
+	for {
+		select {
+		case rawData := <-respChan:
+			if rawData.Command == "error" {
+				var respErr Error
+				err = json.Unmarshal(rawData.Data, &respErr)
+				if err != nil {
+					return fmt.Errorf("failed to parse error response: %w", err)
+				}
+				return respErr
 			}
-			return respErr
-		}
-		if respData != nil {
-			err = json.Unmarshal(rawData.Data, &respData)
-			if err != nil {
-				return fmt.Errorf("failed to parse response: %w", err)
+			if respData != nil {
+				err = json.Unmarshal(rawData.Data, &respData)
+				if err != nil {
+					return fmt.Errorf("failed to parse response: %w", err)
+				}
 			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			ipc.log.Debugfln("Still waiting for response to %s/%d", cmd, reqID)
+		case <-hardTimeout:
+			ipc.log.Errorfln("Didn't get response to %s/%d after %v, giving up", cmd, reqID, hardTimeout)
+			return ErrIPCTimeout
 		}
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("context finished: %w", ctx.Err())
 	}
 }
 

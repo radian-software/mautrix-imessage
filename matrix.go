@@ -18,17 +18,15 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"maunium.net/go/maulogger/v2"
-
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-imessage/imessage"
@@ -37,45 +35,47 @@ import (
 const DefaultSyncProxyBackoff = 1 * time.Second
 const MaxSyncProxyBackoff = 60 * time.Second
 
-type MatrixHandler struct {
-	bridge      *Bridge
-	as          *appservice.AppService
+type WebsocketCommandHandler struct {
+	bridge      *IMBridge
 	log         maulogger.Logger
-	cmd         *CommandHandler
 	errorTxnIDC *appservice.TransactionIDCache
 
 	lastSyncProxyError time.Time
 	syncProxyBackoff   time.Duration
 	syncProxyWaiting   int64
+
+	createRoomsForBackfillError error
 }
 
-func NewMatrixHandler(bridge *Bridge) *MatrixHandler {
-	handler := &MatrixHandler{
-		bridge:           bridge,
-		as:               bridge.AS,
-		log:              bridge.Log.Sub("Matrix"),
-		cmd:              NewCommandHandler(bridge),
+func NewWebsocketCommandHandler(br *IMBridge) *WebsocketCommandHandler {
+	handler := &WebsocketCommandHandler{
+		bridge:           br,
+		log:              br.Log.Sub("MatrixWebsocket"),
 		errorTxnIDC:      appservice.NewTransactionIDCache(8),
 		syncProxyBackoff: DefaultSyncProxyBackoff,
 	}
-	bridge.EventProcessor.On(event.EventMessage, handler.HandleMessage)
-	bridge.EventProcessor.On(event.EventReaction, handler.HandleReaction)
-	bridge.EventProcessor.On(event.EventEncrypted, handler.HandleEncrypted)
-	bridge.EventProcessor.On(event.EventSticker, handler.HandleMessage)
-	bridge.EventProcessor.On(event.EventRedaction, handler.HandleRedaction)
-	bridge.EventProcessor.On(event.StateMember, handler.HandleMembership)
-	bridge.EventProcessor.On(event.StateEncryption, handler.HandleEncryption)
-	bridge.EventProcessor.On(event.EphemeralEventReceipt, handler.HandleReceipt)
-	bridge.EventProcessor.On(event.EphemeralEventTyping, handler.HandleTyping)
-	bridge.AS.SetWebsocketCommandHandler("ping", handler.handleWSPing)
-	bridge.AS.SetWebsocketCommandHandler("syncproxy_error", handler.handleWSSyncProxyError)
-	bridge.AS.SetWebsocketCommandHandler("start_dm", handler.handleWSStartDM)
-	bridge.AS.SetWebsocketCommandHandler("resolve_identifier", handler.handleWSStartDM)
-	bridge.AS.SetWebsocketCommandHandler("list_contacts", handler.handleWSGetContacts)
+	br.AS.PrepareWebsocket()
+	br.AS.SetWebsocketCommandHandler("ping", handler.handleWSPing)
+	br.AS.SetWebsocketCommandHandler("syncproxy_error", handler.handleWSSyncProxyError)
+	br.AS.SetWebsocketCommandHandler("create_group", handler.handleWSCreateGroup)
+	br.AS.SetWebsocketCommandHandler("start_dm", handler.handleWSStartDM)
+	br.AS.SetWebsocketCommandHandler("resolve_identifier", handler.handleWSStartDM)
+	br.AS.SetWebsocketCommandHandler("list_contacts", handler.handleWSGetContacts)
+	br.AS.SetWebsocketCommandHandler("upload_contacts", handler.handleWSUploadContacts)
+	br.AS.SetWebsocketCommandHandler("edit_ghost", handler.handleWSEditGhost)
+	br.AS.SetWebsocketCommandHandler("do_hacky_test", handler.handleWSHackyTest)
+	br.AS.SetWebsocketCommandHandler("create_rooms_for_backfill", handler.handleCreateRoomsForBackfill)
+	br.AS.SetWebsocketCommandHandler("get_room_info_for_backfill", handler.handleGetRoomInfoForBackfill)
 	return handler
 }
 
-func (mx *MatrixHandler) handleWSPing(cmd appservice.WebsocketCommand) (bool, interface{}) {
+func (mx *WebsocketCommandHandler) handleWSHackyTest(cmd appservice.WebsocketCommand) (bool, any) {
+	mx.log.Debugfln("Starting hacky test due to manual request")
+	mx.bridge.hackyStartupTests(false, true)
+	return true, nil
+}
+
+func (mx *WebsocketCommandHandler) handleWSPing(cmd appservice.WebsocketCommand) (bool, interface{}) {
 	var status imessage.BridgeStatus
 
 	if mx.bridge.latestState != nil {
@@ -92,7 +92,7 @@ func (mx *MatrixHandler) handleWSPing(cmd appservice.WebsocketCommand) (bool, in
 	return true, &status
 }
 
-func (mx *MatrixHandler) handleWSSyncProxyError(cmd appservice.WebsocketCommand) (bool, interface{}) {
+func (mx *WebsocketCommandHandler) handleWSSyncProxyError(cmd appservice.WebsocketCommand) (bool, interface{}) {
 	var data mautrix.RespError
 	err := json.Unmarshal(cmd.Data, &data)
 
@@ -115,11 +115,60 @@ type ProfileOverride struct {
 	PhotoURL    string `json:"photo_url,omitempty"`
 }
 
+type EditGhostRequest struct {
+	UserID id.UserID `json:"user_id"`
+	RoomID id.RoomID `json:"room_id"`
+	Reset  bool      `json:"reset"`
+	ProfileOverride
+}
+
+func (mx *WebsocketCommandHandler) handleWSEditGhost(cmd appservice.WebsocketCommand) (bool, interface{}) {
+	var req EditGhostRequest
+	if err := json.Unmarshal(cmd.Data, &req); err != nil {
+		return false, fmt.Errorf("failed to parse request: %w", err)
+	}
+	var puppet *Puppet
+	if req.UserID != "" {
+		puppet = mx.bridge.GetPuppetByMXID(req.UserID)
+		if puppet == nil {
+			return false, fmt.Errorf("user is not a bridge ghost")
+		}
+	} else if req.RoomID != "" {
+		portal := mx.bridge.GetPortalByMXID(req.RoomID)
+		if portal == nil {
+			return false, fmt.Errorf("unknown room ID provided")
+		} else if !portal.IsPrivateChat() {
+			return false, fmt.Errorf("provided room is not a direct chat")
+		} else if puppet = portal.GetDMPuppet(); puppet == nil {
+			return false, fmt.Errorf("unexpected error: private chat portal doesn't have ghost")
+		}
+	} else {
+		return false, fmt.Errorf("neither room nor user ID were provided")
+	}
+	if req.Reset {
+		puppet.log.Debugfln("Marking name as not overridden and resyncing profile")
+		puppet.NameOverridden = false
+		puppet.Update()
+		puppet.Sync()
+	} else {
+		puppet.log.Debugfln("Updating profile with %+v", req.ProfileOverride)
+		puppet.SyncWithProfileOverride(req.ProfileOverride)
+	}
+	return true, struct{}{}
+}
+
 type StartDMRequest struct {
 	Identifier string `json:"identifier"`
+	Force      bool   `json:"force"`
 	ProfileOverride
 
 	ActuallyStart bool `json:"-"`
+}
+
+type CreateGroupRequest struct {
+	Users []string `json:"users"`
+
+	AllowSMS bool `json:"allow_sms"`
 }
 
 type StartDMResponse struct {
@@ -128,7 +177,7 @@ type StartDMResponse struct {
 	JustCreated bool      `json:"just_created"`
 }
 
-func (mx *MatrixHandler) handleWSStartDM(cmd appservice.WebsocketCommand) (bool, interface{}) {
+func (mx *WebsocketCommandHandler) handleWSStartDM(cmd appservice.WebsocketCommand) (bool, interface{}) {
 	var req StartDMRequest
 	if err := json.Unmarshal(cmd.Data, &req); err != nil {
 		return false, fmt.Errorf("failed to parse request: %w", err)
@@ -136,13 +185,55 @@ func (mx *MatrixHandler) handleWSStartDM(cmd appservice.WebsocketCommand) (bool,
 	req.ActuallyStart = cmd.Command == "start_dm"
 	resp, err := mx.StartChat(req)
 	if err != nil {
+		mx.log.Errorfln("Error in %s handler: %v", cmd.Command, err)
 		return false, err
 	} else {
 		return true, resp
 	}
 }
 
-func (mx *MatrixHandler) handleWSGetContacts(_ appservice.WebsocketCommand) (bool, interface{}) {
+func (mx *WebsocketCommandHandler) handleWSCreateGroup(cmd appservice.WebsocketCommand) (bool, interface{}) {
+	var req CreateGroupRequest
+	err := json.Unmarshal(cmd.Data, &req)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse request: %w", err)
+	}
+	guids := make([]string, len(req.Users))
+	for i, identifier := range req.Users {
+		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
+			guids[i] = identifier
+		} else {
+			guids[i], err = mx.bridge.IM.ResolveIdentifier(identifier)
+			if err != nil {
+				return false, fmt.Errorf("failed to resolve identifier %s: %w", identifier, err)
+			}
+		}
+		if strings.HasPrefix(guids[i], "SMS;-;") && !req.AllowSMS {
+			return false, fmt.Errorf("%s is only available on SMS", identifier)
+		}
+	}
+	mx.log.Debugfln("Creating group with guids %+v (resolved from identifiers %+v)", guids, req.Users)
+	createResp, err := mx.bridge.IM.CreateGroup(guids)
+	if err != nil {
+		return false, fmt.Errorf("failed to create group: %w", err)
+	}
+	mx.log.Infofln("Created group %s (%s)", createResp.GUID, createResp.ThreadID)
+	portal := mx.bridge.GetPortalByGUID(createResp.GUID)
+	portal.ThreadID = createResp.ThreadID
+	resp := StartDMResponse{
+		RoomID:      portal.MXID,
+		GUID:        createResp.GUID,
+		JustCreated: len(portal.MXID) == 0,
+	}
+	err = portal.CreateMatrixRoom(nil, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create Matrix room: %w", err)
+	}
+	resp.RoomID = portal.MXID
+	return true, &resp
+}
+
+func (mx *WebsocketCommandHandler) handleWSGetContacts(_ appservice.WebsocketCommand) (bool, interface{}) {
 	contacts, err := mx.bridge.IM.GetContactList()
 	if err != nil {
 		return false, err
@@ -150,13 +241,71 @@ func (mx *MatrixHandler) handleWSGetContacts(_ appservice.WebsocketCommand) (boo
 	return true, contacts
 }
 
-func (mx *MatrixHandler) StartChat(req StartDMRequest) (*StartDMResponse, error) {
+type UploadContactsRequest struct {
+	Contacts []*imessage.Contact `json:"contacts"`
+}
+
+func (mx *WebsocketCommandHandler) handleWSUploadContacts(cmd appservice.WebsocketCommand) (bool, any) {
+	var req UploadContactsRequest
+	if err := json.Unmarshal(cmd.Data, &req); err != nil {
+		return false, fmt.Errorf("failed to parse request: %w", err)
+	}
+	mx.bridge.UpdateMerges(req.Contacts)
+	return true, nil
+}
+
+func isNumber(number string) bool {
+	for _, char := range number {
+		if (char < '0' || char > '9') && char != '+' {
+			return false
+		}
+	}
+	return true
+}
+
+func (mx *WebsocketCommandHandler) trackResolveIdentifier(actuallyTrack bool, identifier, status string) {
+	if actuallyTrack {
+		identifierType := "unknown"
+		if isNumber(identifierType) {
+			identifierType = "phone"
+		} else if strings.ContainsRune(identifier, '@') {
+			identifierType = "email"
+		}
+		Segment.Track("iMC resolve identifier", map[string]any{
+			"status":            status,
+			"is_startup_target": strconv.FormatBool(identifier == mx.bridge.Config.HackyStartupTest.Identifier),
+			"identifier_type":   identifierType,
+			"tmp_identifier":    identifier,
+		})
+	}
+}
+
+func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMResponse, error) {
 	var resp StartDMResponse
 	var err error
+	var forced bool
 
 	if resp.GUID, err = mx.bridge.IM.ResolveIdentifier(req.Identifier); err != nil {
-		return nil, fmt.Errorf("failed to resolve identifier: %w", err)
+		if req.Force && req.ActuallyStart {
+			mx.log.Debugfln("Failed to resolve identifier %s (%v), but forcing creation anyway", req.Identifier, err)
+			resp.GUID = req.Identifier
+			forced = true
+		} else {
+			mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
+			return nil, fmt.Errorf("failed to resolve identifier: %w", err)
+		}
+	}
+	if parsed := imessage.ParseIdentifier(resp.GUID); parsed.Service == "SMS" && !isNumber(parsed.LocalID) {
+		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
+		return nil, fmt.Errorf("can't start SMS with non-numeric identifier")
 	} else if portal := mx.bridge.GetPortalByGUID(resp.GUID); len(portal.MXID) > 0 || !req.ActuallyStart {
+		status := "success"
+		if parsed.Service == "SMS" {
+			status = "sms"
+		}
+		if !forced {
+			mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, status)
+		}
 		resp.RoomID = portal.MXID
 		return &resp, nil
 	} else if err = mx.bridge.IM.PrepareDM(resp.GUID); err != nil {
@@ -170,7 +319,7 @@ func (mx *MatrixHandler) StartChat(req StartDMRequest) (*StartDMResponse, error)
 	}
 }
 
-func (mx *MatrixHandler) HandleSyncProxyError(syncErr *mautrix.RespError, startErr error) {
+func (mx *WebsocketCommandHandler) HandleSyncProxyError(syncErr *mautrix.RespError, startErr error) {
 	if !atomic.CompareAndSwapInt64(&mx.syncProxyWaiting, 0, 1) {
 		var err interface{} = startErr
 		if err == nil {
@@ -195,230 +344,112 @@ func (mx *MatrixHandler) HandleSyncProxyError(syncErr *mautrix.RespError, startE
 	}
 	time.Sleep(mx.syncProxyBackoff)
 	atomic.StoreInt64(&mx.syncProxyWaiting, 0)
-	mx.bridge.requestStartSync()
+	mx.bridge.RequestStartSync()
 }
 
-func (mx *MatrixHandler) HandleEncryption(evt *event.Event) {
-	if evt.Content.AsEncryption().Algorithm != id.AlgorithmMegolmV1 {
-		return
-	}
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal != nil && !portal.Encrypted {
-		mx.log.Debugfln("%s enabled encryption in %s", evt.Sender, evt.RoomID)
-		portal.Encrypted = true
-		portal.Update()
-	}
+type NewRoomBackfillRequest struct {
+	Chats []*imessage.ChatInfo `json:"chats"`
 }
 
-func (mx *MatrixHandler) joinAndCheckMembers(evt *event.Event, intent *appservice.IntentAPI) *mautrix.RespJoinedMembers {
-	resp, err := intent.JoinRoomByID(evt.RoomID)
-	if err != nil {
-		mx.log.Debugfln("Failed to join room %s as %s with invite from %s: %v", evt.RoomID, intent.UserID, evt.Sender, err)
-		return nil
+func (mx *WebsocketCommandHandler) handleCreateRoomsForBackfill(cmd appservice.WebsocketCommand) (bool, any) {
+	var req NewRoomBackfillRequest
+	if err := json.Unmarshal(cmd.Data, &req); err != nil {
+		return false, fmt.Errorf("failed to parse request: %w", err)
 	}
 
-	members, err := intent.JoinedMembers(resp.RoomID)
-	if err != nil {
-		mx.log.Debugfln("Failed to get members in room %s after accepting invite from %s as %s: %v", resp.RoomID, evt.Sender, intent.UserID, err)
-		_, _ = intent.LeaveRoom(resp.RoomID)
-		return nil
-	}
+	mx.log.Debugfln("Got request to create %d rooms for backfill", len(req.Chats))
+	go func() {
+		mx.createRoomsForBackfillError = nil
+		for _, info := range req.Chats {
+			info.Identifier = imessage.ParseIdentifier(info.JSONChatGUID)
+			portals := mx.bridge.FindPortalsByThreadID(info.ThreadID)
+			var portal *Portal
+			if len(portals) > 1 {
+				mx.log.Warnfln("Found multiple portals with thread ID %s (message chat guid: %s)", info.ThreadID, info.Identifier.String())
+				continue
+			} else if len(portals) == 1 {
+				portal = portals[0]
+			} else {
+				// This will create the new portal
+				portal = mx.bridge.GetPortalByGUID(info.Identifier.String())
+			}
 
-	if len(members.Joined) < 2 {
-		mx.log.Debugln("Leaving empty room", resp.RoomID, "after accepting invite from", evt.Sender, "as", intent.UserID)
-		_, _ = intent.LeaveRoom(resp.RoomID)
-		return nil
-	}
-	return members
+			if len(portal.MXID) == 0 {
+				portal.zlog.Info().Msg("Creating Matrix room with latest chat info")
+				err := portal.CreateMatrixRoom(info, nil)
+				if err != nil {
+					mx.createRoomsForBackfillError = err
+					return
+				}
+			} else {
+				portal.zlog.Info().Msg("Syncing Matrix room with latest chat info")
+				portal.SyncWithInfo(info)
+			}
+
+			mx.log.Debugfln("Room %s created for backfilling %s", portal.MXID, info.JSONChatGUID)
+		}
+	}()
+	return true, struct{}{}
 }
 
-func (mx *MatrixHandler) HandleBotInvite(evt *event.Event) {
-	intent := mx.as.BotIntent()
-
-	if evt.Sender != mx.bridge.user.MXID {
-		return
-	}
-
-	mx.joinAndCheckMembers(evt, intent)
+type RoomInfoForBackfillRequest struct {
+	ChatGUIDs []string `json:"chats_guids"`
 }
 
-func (mx *MatrixHandler) HandleMembership(evt *event.Event) {
-	if _, isPuppet := mx.bridge.ParsePuppetMXID(evt.Sender); evt.Sender == mx.bridge.Bot.UserID || isPuppet {
-		return
-	}
+type RoomInfoForBackfill struct {
+	RoomID                   id.RoomID `json:"room_id"`
+	EarliestBridgedTimestamp int64     `json:"earliest_bridged_timestamp"`
+}
 
-	if mx.bridge.Crypto != nil {
-		mx.bridge.Crypto.HandleMemberEvent(evt)
-	}
+type RoomCreationForBackfillStatus string
 
-	content := evt.Content.AsMember()
-	if content.Membership == event.MembershipInvite && id.UserID(evt.GetStateKey()) == mx.as.BotMXID() {
-		mx.HandleBotInvite(evt)
-		return
-	} else if content.Membership == event.MembershipLeave {
-		portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-		if portal != nil {
-			mx.log.Debugfln("Got leave event of %s in %s, checking if it needs to be cleaned up", evt.GetStateKey(), evt.RoomID)
-			portal.CleanupIfEmpty(true)
+const (
+	RoomCreationForBackfillStatusInProgress RoomCreationForBackfillStatus = "in-progress"
+	RoomCreationForBackfillStatusDone       RoomCreationForBackfillStatus = "done"
+	RoomCreationForBackfillStatusError      RoomCreationForBackfillStatus = "error"
+)
+
+type RoomInfoForBackfillResponse struct {
+	Status RoomCreationForBackfillStatus  `json:"status"`
+	Error  string                         `json:"error,omitempty"`
+	Rooms  map[string]RoomInfoForBackfill `json:"rooms,omitempty"`
+}
+
+func (mx *WebsocketCommandHandler) handleGetRoomInfoForBackfill(cmd appservice.WebsocketCommand) (bool, any) {
+	if mx.createRoomsForBackfillError != nil {
+		return true, RoomInfoForBackfillResponse{
+			Status: RoomCreationForBackfillStatusError,
+			Error:  mx.createRoomsForBackfillError.Error(),
 		}
 	}
 
-	// TODO handle puppet invites to create chats?
-}
-
-func (mx *MatrixHandler) shouldIgnoreEvent(evt *event.Event) bool {
-	if mx.bridge.isBridgeOwnedMXID(evt.Sender) {
-		return true
-	} else if evt.Sender != mx.bridge.user.MXID && !mx.bridge.Config.Bridge.Relay.IsWhitelisted(evt.Sender) {
-		return true
-	} else if val, ok := evt.Content.Raw[doublePuppetKey].(string); ok && evt.Sender == mx.bridge.user.MXID && val == doublePuppetValue {
-		return true
-	}
-	return false
-}
-
-const sessionWaitTimeout = 5 * time.Second
-
-func (mx *MatrixHandler) HandleEncrypted(evt *event.Event) {
-	if mx.shouldIgnoreEvent(evt) || mx.bridge.Crypto == nil {
-		return
+	var req RoomInfoForBackfillRequest
+	if err := json.Unmarshal(cmd.Data, &req); err != nil {
+		return false, fmt.Errorf("failed to parse request: %w", err)
 	}
 
-	decrypted, err := mx.bridge.Crypto.Decrypt(evt)
-	decryptionRetryCount := 0
-	if errors.Is(err, NoSessionFound) {
-		content := evt.Content.AsEncrypted()
-		mx.log.Debugfln("Couldn't find session %s trying to decrypt %s, waiting %d seconds...", content.SessionID, evt.ID, int(sessionWaitTimeout.Seconds()))
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, false, decryptionRetryCount)
-		decryptionRetryCount++
-		if mx.bridge.Crypto.WaitForSession(evt.RoomID, content.SenderKey, content.SessionID, sessionWaitTimeout) {
-			mx.log.Debugfln("Got session %s after waiting, trying to decrypt %s again", content.SessionID, evt.ID)
-			decrypted, err = mx.bridge.Crypto.Decrypt(evt)
-		} else {
-			mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), false, decryptionRetryCount)
-			go mx.waitLongerForSession(evt)
-			return
+	resp := RoomInfoForBackfillResponse{
+		Status: RoomCreationForBackfillStatusDone,
+		Rooms:  map[string]RoomInfoForBackfill{},
+	}
+	now := time.Now().UnixMilli()
+	mx.log.Debugfln("Got request to get room info for backfills")
+	for _, chatGUID := range req.ChatGUIDs {
+		portal := mx.bridge.GetPortalByGUID(chatGUID)
+
+		if len(portal.MXID) == 0 {
+			return true, RoomInfoForBackfillResponse{Status: RoomCreationForBackfillStatusInProgress}
+		}
+
+		timestamp, err := mx.bridge.DB.Message.GetEarliestTimestampInChat(chatGUID)
+		if err != nil || timestamp < 0 {
+			timestamp = now
+		}
+		resp.Rooms[portal.GUID] = RoomInfoForBackfill{
+			RoomID:                   portal.MXID,
+			EarliestBridgedTimestamp: timestamp,
 		}
 	}
-	if err != nil {
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true, decryptionRetryCount)
 
-		mx.log.Warnfln("Failed to decrypt %s: %v", evt.ID, err)
-		_, _ = mx.bridge.Bot.SendNotice(evt.RoomID, fmt.Sprintf("\u26a0 Your message was not bridged: %v", err))
-		return
-	}
-	mx.as.SendMessageSendCheckpoint(evt, appservice.StepDecrypted, decryptionRetryCount)
-	mx.bridge.EventProcessor.Dispatch(decrypted)
-}
-
-func (mx *MatrixHandler) waitLongerForSession(evt *event.Event) {
-	const extendedTimeout = sessionWaitTimeout * 3
-
-	content := evt.Content.AsEncrypted()
-	mx.log.Debugfln("Couldn't find session %s trying to decrypt %s, waiting %d more seconds...",
-		content.SessionID, evt.ID, int(extendedTimeout.Seconds()))
-
-	go mx.bridge.Crypto.RequestSession(evt.RoomID, content.SenderKey, content.SessionID, evt.Sender, content.DeviceID)
-
-	resp, err := mx.bridge.Bot.SendNotice(evt.RoomID, fmt.Sprintf(
-		"\u26a0 Your message was not bridged: the bridge hasn't received the decryption keys. "+
-			"The bridge will retry for %d seconds. If this error keeps happening, try restarting your client.",
-		int(extendedTimeout.Seconds())))
-	if err != nil {
-		mx.log.Errorfln("Failed to send decryption error to %s: %v", evt.RoomID, err)
-	}
-	update := event.MessageEventContent{MsgType: event.MsgNotice}
-
-	if mx.bridge.Crypto.WaitForSession(evt.RoomID, content.SenderKey, content.SessionID, extendedTimeout) {
-		mx.log.Debugfln("Got session %s after waiting more, trying to decrypt %s again", content.SessionID, evt.ID)
-		var decrypted *event.Event
-		decrypted, err = mx.bridge.Crypto.Decrypt(evt)
-		if err == nil {
-			mx.as.SendMessageSendCheckpoint(evt, appservice.StepDecrypted, 2)
-			mx.bridge.EventProcessor.Dispatch(decrypted)
-			_, _ = mx.bridge.Bot.RedactEvent(evt.RoomID, resp.EventID)
-			return
-		}
-		mx.log.Warnfln("Failed to decrypt %s: %v", evt.ID, err)
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, err, true, 2)
-		update.Body = fmt.Sprintf("\u26a0 Your message was not bridged: %v", err)
-	} else {
-		mx.log.Debugfln("Didn't get %s, giving up on %s", content.SessionID, evt.ID)
-		mx.as.SendErrorMessageSendCheckpoint(evt, appservice.StepDecrypted, fmt.Errorf("didn't receive encryption keys"), true, 2)
-		update.Body = "\u26a0 Your message was not bridged: the bridge hasn't received the decryption keys. " +
-			"If this error keeps happening, try restarting your client."
-	}
-
-	newContent := update
-	update.NewContent = &newContent
-	if resp != nil {
-		update.RelatesTo = &event.RelatesTo{
-			Type:    event.RelReplace,
-			EventID: resp.EventID,
-		}
-	}
-	_, err = mx.bridge.Bot.SendMessageEvent(evt.RoomID, event.EventMessage, &update)
-	if err != nil {
-		mx.log.Debugfln("Failed to update decryption error notice %s: %v", resp.EventID, err)
-	}
-}
-
-func (mx *MatrixHandler) HandleMessage(evt *event.Event) {
-	if mx.shouldIgnoreEvent(evt) {
-		return
-	}
-
-	content := evt.Content.AsMessage()
-	content.RemoveReplyFallback()
-	if evt.Sender == mx.bridge.user.MXID && content.MsgType == event.MsgText && strings.HasPrefix(content.Body, mx.bridge.Config.Bridge.CommandPrefix) {
-		content.Body = strings.TrimPrefix(content.Body, mx.bridge.Config.Bridge.CommandPrefix)
-		content.Body = strings.TrimLeft(content.Body, " ")
-		mx.cmd.Handle(evt.RoomID, evt.ID, content.Body, content.GetReplyTo())
-		return
-	}
-
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal != nil {
-		portal.MatrixMessages <- evt
-	}
-}
-
-func (mx *MatrixHandler) HandleReaction(evt *event.Event) {
-	if mx.shouldIgnoreEvent(evt) {
-		return
-	}
-
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal != nil {
-		portal.HandleMatrixReaction(evt)
-	}
-}
-
-func (mx *MatrixHandler) HandleRedaction(evt *event.Event) {
-	if mx.shouldIgnoreEvent(evt) {
-		return
-	}
-
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal != nil {
-		portal.HandleMatrixRedaction(evt)
-	}
-}
-
-func (mx *MatrixHandler) HandleReceipt(evt *event.Event) {
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal == nil {
-		return
-	}
-
-	mx.bridge.user.handleReceiptEvent(portal, evt)
-}
-
-func (mx *MatrixHandler) HandleTyping(evt *event.Event) {
-	portal := mx.bridge.GetPortalByMXID(evt.RoomID)
-	if portal == nil {
-		return
-	}
-
-	mx.bridge.user.handleTypingEvent(portal, evt)
+	return true, resp
 }

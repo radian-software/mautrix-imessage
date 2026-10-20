@@ -1,6 +1,7 @@
 .idea
 
 *.yaml
+!.pre-commit-config.yaml
 !example-config.yaml
 !example-registration.yaml
 
@@ -10,3 +11,4 @@
 *.log
 
 /mautrix-imessage
+/start

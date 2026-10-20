@@ -17,42 +17,54 @@
 package ios
 
 import (
+	"maunium.net/go/mautrix/id"
+
 	"go.mau.fi/mautrix-imessage/imessage"
 	"go.mau.fi/mautrix-imessage/ipc"
 )
 
 const (
-	ReqSendMessage       ipc.Command = "send_message"
-	ReqSendMedia         ipc.Command = "send_media"
-	ReqSendTapback       ipc.Command = "send_tapback"
-	ReqSendReadReceipt   ipc.Command = "send_read_receipt"
-	ReqSetTyping         ipc.Command = "set_typing"
-	ReqGetChats          ipc.Command = "get_chats"
-	ReqGetChat           ipc.Command = "get_chat"
-	ReqGetChatAvatar     ipc.Command = "get_chat_avatar"
-	ReqGetContact        ipc.Command = "get_contact"
-	ReqGetContactList    ipc.Command = "get_contact_list"
-	ReqGetMessagesAfter  ipc.Command = "get_messages_after"
-	ReqGetRecentMessages ipc.Command = "get_recent_messages"
-	ReqPreStartupSync    ipc.Command = "pre_startup_sync"
-	ReqResolveIdentifier ipc.Command = "resolve_identifier"
-	ReqPrepareDM         ipc.Command = "prepare_dm"
+	ReqSendMessage         ipc.Command = "send_message"
+	ReqSendMedia           ipc.Command = "send_media"
+	ReqSendTapback         ipc.Command = "send_tapback"
+	ReqSendReadReceipt     ipc.Command = "send_read_receipt"
+	ReqSetTyping           ipc.Command = "set_typing"
+	ReqGetChats            ipc.Command = "get_chats"
+	ReqGetChat             ipc.Command = "get_chat"
+	ReqGetChatAvatar       ipc.Command = "get_chat_avatar"
+	ReqGetContact          ipc.Command = "get_contact"
+	ReqGetContactList      ipc.Command = "get_contact_list"
+	ReqGetMessagesAfter    ipc.Command = "get_messages_after"
+	ReqGetRecentMessages   ipc.Command = "get_recent_messages"
+	ReqGetMessage          ipc.Command = "get_message"
+	ReqPreStartupSync      ipc.Command = "pre_startup_sync"
+	ReqPostStartupSync     ipc.Command = "post_startup_sync"
+	ReqResolveIdentifier   ipc.Command = "resolve_identifier"
+	ReqPrepareDM           ipc.Command = "prepare_dm"
+	ReqCreateGroup         ipc.Command = "prepare_group_chat"
+	ReqMessageBridgeResult ipc.Command = "message_bridge_result"
+	ReqChatBridgeResult    ipc.Command = "chat_bridge_result"
+	ReqBackfillResult      ipc.Command = "backfill_result"
+	ReqUpcomingMessage     ipc.Command = "upcoming_message"
 )
 
 type SendMessageRequest struct {
-	ChatGUID    string `json:"chat_guid"`
-	Text        string `json:"text"`
-	ReplyTo     string `json:"reply_to"`
-	ReplyToPart int    `json:"reply_to_part"`
+	ChatGUID    string                   `json:"chat_guid"`
+	Text        string                   `json:"text"`
+	ReplyTo     string                   `json:"reply_to"`
+	ReplyToPart int                      `json:"reply_to_part"`
+	RichLink    *imessage.RichLink       `json:"rich_link,omitempty"`
+	Metadata    imessage.MessageMetadata `json:"metadata,omitempty"`
 }
 
 type SendMediaRequest struct {
 	ChatGUID string `json:"chat_guid"`
 	Text     string `json:"text"`
 	imessage.Attachment
-	ReplyTo        string `json:"reply_to"`
-	ReplyToPart    int    `json:"reply_to_part"`
-	IsAudioMessage bool   `json:"is_audio_message"`
+	ReplyTo        string                   `json:"reply_to"`
+	ReplyToPart    int                      `json:"reply_to_part"`
+	IsAudioMessage bool                     `json:"is_audio_message"`
+	Metadata       imessage.MessageMetadata `json:"metadata,omitempty"`
 }
 
 type SendTapbackRequest struct {
@@ -74,6 +86,7 @@ type SetTypingRequest struct {
 
 type GetChatRequest struct {
 	ChatGUID string `json:"chat_guid"`
+	ThreadID string `json:"thread_id"`
 }
 
 type GetChatsRequest struct {
@@ -89,13 +102,19 @@ type GetContactListResponse struct {
 }
 
 type GetRecentMessagesRequest struct {
-	ChatGUID string `json:"chat_guid"`
-	Limit    int    `json:"limit"`
+	ChatGUID   string `json:"chat_guid"`
+	Limit      int    `json:"limit"`
+	BackfillID string `json:"backfill_id"`
+}
+
+type GetMessageRequest struct {
+	GUID string `json:"guid"`
 }
 
 type GetMessagesAfterRequest struct {
-	ChatGUID  string  `json:"chat_guid"`
-	Timestamp float64 `json:"timestamp"`
+	ChatGUID   string  `json:"chat_guid"`
+	Timestamp  float64 `json:"timestamp"`
+	BackfillID string  `json:"backfill_id"`
 }
 
 type PingServerResponse struct {
@@ -114,4 +133,32 @@ type ResolveIdentifierResponse struct {
 
 type PrepareDMRequest struct {
 	GUID string `json:"guid"`
+}
+
+type CreateGroupRequest struct {
+	GUIDs []string `json:"guids"`
+}
+
+type MessageBridgeResult struct {
+	ChatGUID string     `json:"chat_guid"`
+	GUID     string     `json:"message_guid"`
+	EventID  id.EventID `json:"event_id,omitempty"`
+	Success  bool       `json:"success"`
+}
+
+type ChatBridgeResult struct {
+	ChatGUID string    `json:"chat_guid"`
+	MXID     id.RoomID `json:"mxid"`
+}
+
+type BackfillResult struct {
+	ChatGUID   string `json:"chat_guid"`
+	BackfillID string `json:"backfill_id"`
+	Success    bool   `json:"success"`
+
+	MessageIDs map[string][]id.EventID `json:"message_ids"`
+}
+
+type UpcomingMessage struct {
+	EventID id.EventID `json:"event_id"`
 }

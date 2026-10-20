@@ -17,77 +17,64 @@
 package database
 
 import (
-	"database/sql"
-
 	_ "github.com/mattn/go-sqlite3"
+	"maunium.net/go/maulogger/v2"
 
-	log "maunium.net/go/maulogger/v2"
+	"go.mau.fi/util/dbutil"
 
 	"go.mau.fi/mautrix-imessage/database/upgrades"
 )
 
 type Database struct {
-	*sql.DB
-	log     log.Logger
-	dialect string
+	*dbutil.Database
 
-	User    *UserQuery
-	Portal  *PortalQuery
-	Puppet  *PuppetQuery
-	Message *MessageQuery
-	Tapback *TapbackQuery
-	KV      *KeyValueQuery
+	User       *UserQuery
+	Portal     *PortalQuery
+	Puppet     *PuppetQuery
+	Message    *MessageQuery
+	Tapback    *TapbackQuery
+	KV         *KeyValueQuery
+	MergedChat *MergedChatQuery
+	Backfill   *BackfillQuery
 }
 
-func New(dbType string, uri string, baseLog log.Logger) (*Database, error) {
-	conn, err := sql.Open(dbType, uri)
-	if err != nil {
-		return nil, err
-	}
-
+func New(parent *dbutil.Database, log maulogger.Logger) *Database {
 	db := &Database{
-		DB:      conn,
-		log:     baseLog.Sub("Database"),
-		dialect: dbType,
+		Database: parent,
 	}
-	if dbType == "sqlite3" {
-		_, err = conn.Exec("PRAGMA foreign_keys = ON")
-		if err != nil {
-			db.log.Warnln("Failed to enable foreign keys:", err)
-		}
-	}
+	db.UpgradeTable = upgrades.Table
 
 	db.User = &UserQuery{
 		db:  db,
-		log: db.log.Sub("User"),
+		log: log.Sub("User"),
 	}
 	db.Portal = &PortalQuery{
 		db:  db,
-		log: db.log.Sub("Portal"),
+		log: log.Sub("Portal"),
 	}
 	db.Puppet = &PuppetQuery{
 		db:  db,
-		log: db.log.Sub("Puppet"),
+		log: log.Sub("Puppet"),
 	}
 	db.Message = &MessageQuery{
 		db:  db,
-		log: db.log.Sub("Message"),
+		log: log.Sub("Message"),
 	}
 	db.Tapback = &TapbackQuery{
 		db:  db,
-		log: db.log.Sub("Tapback"),
+		log: log.Sub("Tapback"),
 	}
 	db.KV = &KeyValueQuery{
 		db:  db,
-		log: db.log.Sub("KeyValue"),
+		log: log.Sub("KeyValue"),
 	}
-	return db, nil
-}
-
-func (db *Database) Init() error {
-	return upgrades.Run(db.log.Sub("Upgrade"), db.dialect, db.DB)
-}
-
-type Scannable interface {
-	Scan(...interface{}) error
+	db.MergedChat = &MergedChatQuery{
+		db:  db,
+		log: log.Sub("MergedChat"),
+	}
+	db.Backfill = &BackfillQuery{
+		db:  db,
+		log: log.Sub("Backfill"),
+	}
+	return db
 }

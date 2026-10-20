@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/rs/zerolog"
 	log "maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix/id"
@@ -34,34 +35,59 @@ var (
 	ErrNotLoggedIn = errors.New("you're not logged into iMessage")
 )
 
+type ContactAPI interface {
+	GetContactInfo(identifier string) (*Contact, error)
+	GetContactList() ([]*Contact, error)
+	SearchContactList(searchTerms string) ([]*Contact, error)
+	RefreshContactList() error
+}
+
+type ChatInfoAPI interface {
+	GetChatInfo(chatID, threadID string) (*ChatInfo, error)
+	GetGroupAvatar(chatID string) (*Attachment, error)
+}
+
+type VenturaFeatures interface {
+	UnsendMessage(chatID, targetGUID string, targetPart int) (*SendResponse, error)
+	EditMessage(chatID, targetGUID string, newText string, targetPart int) (*SendResponse, error)
+}
+
 type API interface {
-	Start() error
+	Start(readyCallback func()) error
 	Stop()
-	GetMessagesSinceDate(chatID string, minDate time.Time) ([]*Message, error)
-	GetMessagesWithLimit(chatID string, limit int) ([]*Message, error)
-	GetChatsWithMessagesAfter(minDate time.Time) ([]string, error)
+	GetMessagesSinceDate(chatID string, minDate time.Time, backfillID string) ([]*Message, error)
+	GetMessagesBetween(chatID string, minDate, maxDate time.Time) ([]*Message, error)
+	GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) ([]*Message, error)
+	GetMessagesWithLimit(chatID string, limit int, backfillID string) ([]*Message, error)
+	GetChatsWithMessagesAfter(minDate time.Time) ([]ChatIdentifier, error)
+	GetMessage(guid string) (*Message, error)
 	MessageChan() <-chan *Message
 	ReadReceiptChan() <-chan *ReadReceipt
 	TypingNotificationChan() <-chan *TypingNotification
 	ChatChan() <-chan *ChatInfo
 	ContactChan() <-chan *Contact
 	MessageStatusChan() <-chan *SendMessageStatus
-	GetContactInfo(identifier string) (*Contact, error)
-	GetContactList() ([]*Contact, error)
-	GetChatInfo(chatID string) (*ChatInfo, error)
-	GetGroupAvatar(chatID string) (*Attachment, error)
+	BackfillTaskChan() <-chan *BackfillTask
+	ContactAPI
+	ChatInfoAPI
 
 	ResolveIdentifier(identifier string) (string, error)
 	PrepareDM(guid string) error
+	CreateGroup(guids []string) (*CreateGroupResponse, error)
 
-	SendMessage(chatID, text string, replyTo string, replyToPart int) (*SendResponse, error)
-	SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool) (*SendResponse, error)
+	SendMessage(chatID, text string, replyTo string, replyToPart int, richLink *RichLink, metadata MessageMetadata) (*SendResponse, error)
+	SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata MessageMetadata) (*SendResponse, error)
 	SendFileCleanup(sendFileDir string)
 	SendTapback(chatID, targetGUID string, targetPart int, tapback TapbackType, remove bool) (*SendResponse, error)
 	SendReadReceipt(chatID, readUpTo string) error
 	SendTypingNotification(chatID string, typing bool) error
+	SendMessageBridgeResult(chatID, messageID string, eventID id.EventID, success bool)
+	SendBackfillResult(chatID, backfillID string, success bool, idMap map[string][]id.EventID)
+	SendChatBridgeResult(guid string, mxid id.RoomID)
+	NotifyUpcomingMessage(eventID id.EventID)
 
-	PreStartupSyncHook() error
+	PreStartupSyncHook() (StartupSyncHookResponse, error)
+	PostStartupSyncHook()
 
 	Capabilities() ConnectorCapabilities
 }
@@ -99,10 +125,11 @@ type BridgeStatus struct {
 type Bridge interface {
 	GetIPC() *ipc.Processor
 	GetLog() log.Logger
+	GetZLog() *zerolog.Logger
 	GetConnectorConfig() *PlatformConfig
 	PingServer() (start, serverTs, end time.Time)
 	SendBridgeStatus(state BridgeStatus)
-	ReIDPortal(oldGUID, newGUID string) bool
+	ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool
 	GetMessagesSince(chatGUID string, since time.Time) []string
 	SetPushKey(req *PushKeyRequest)
 }
@@ -115,9 +142,18 @@ type PlatformConfig struct {
 
 	IMRestPath     string   `yaml:"imessage_rest_path"`
 	IMRestArgs     []string `yaml:"imessage_rest_args"`
+	ContactsMode   string   `yaml:"contacts_mode"`
+	HackySetLocale string   `yaml:"hacky_set_locale"`
+	Environment    []string `yaml:"environment"`
 	LogIPCPayloads bool     `yaml:"log_ipc_payloads"`
+	UnixSocket     string   `yaml:"unix_socket"`
 
 	PingInterval int64 `yaml:"ping_interval_seconds"`
+
+	DeleteMediaAfterUpload bool `yaml:"delete_media_after_upload"`
+
+	BlueBubblesURL      string `yaml:"bluebubbles_url"`
+	BlueBubblesPassword string `yaml:"bluebubbles_password"`
 }
 
 func (pc *PlatformConfig) BridgeName() string {

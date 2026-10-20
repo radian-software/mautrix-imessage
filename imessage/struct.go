@@ -41,6 +41,9 @@ type Message struct {
 	JSONTargetGUID string     `json:"target_guid"`
 	Target         Identifier `json:"-"`
 
+	// The service from the sender_guid is extracted and stored here.
+	Service string `json:"service"`
+
 	IsFromMe       bool      `json:"is_from_me"`
 	IsRead         bool      `json:"is_read"`
 	ReadAt         time.Time `json:"-"`
@@ -49,10 +52,14 @@ type Message struct {
 	IsSent         bool
 	IsEmote        bool
 	IsAudioMessage bool `json:"is_audio_message"`
+	IsEdited       bool
+	IsRetracted    bool
 
 	ReplyToGUID string   `json:"thread_originator_guid,omitempty"`
 	ReplyToPart int      `json:"thread_originator_part,omitempty"`
 	Tapback     *Tapback `json:"associated_message,omitempty"`
+
+	ReplyProcessed bool `json:"-"`
 
 	// Deprecated: use attachments array
 	Attachment *Attachment `json:"attachment,omitempty"`
@@ -64,7 +71,15 @@ type Message struct {
 	ItemType        ItemType        `json:"item_type,omitempty"`
 	GroupActionType GroupActionType `json:"group_action_type,omitempty"`
 	NewGroupName    string          `json:"new_group_title,omitempty"`
+
+	RichLink *RichLink `json:"rich_link,omitempty"`
+
+	Metadata MessageMetadata `json:"metadata,omitempty"`
+
+	ThreadID string `json:"thread_id,omitempty"`
 }
+
+type MessageMetadata = map[string]interface{}
 
 func (msg *Message) SenderText() string {
 	if msg.IsFromMe {
@@ -122,10 +137,13 @@ type Contact struct {
 }
 
 func (contact *Contact) HasName() bool {
-	return len(contact.FirstName) > 0 || len(contact.LastName) > 0 || len(contact.Nickname) > 0
+	return contact != nil && (len(contact.FirstName) > 0 || len(contact.LastName) > 0 || len(contact.Nickname) > 0)
 }
 
 func (contact *Contact) Name() string {
+	if contact == nil {
+		return ""
+	}
 	if len(contact.FirstName) > 0 {
 		if len(contact.LastName) > 0 {
 			return fmt.Sprintf("%s %s", contact.FirstName, contact.LastName)
@@ -183,12 +201,23 @@ func (attachment *Attachment) Read() ([]byte, error) {
 	return os.ReadFile(attachment.PathOnDisk)
 }
 
+func (attachment *Attachment) Delete() error {
+	return os.Remove(attachment.PathOnDisk)
+}
+
+type ChatIdentifier struct {
+	ChatGUID string `json:"chat_guid"`
+	ThreadID string `json:"thread_id,omitempty"`
+}
+
 type ChatInfo struct {
 	JSONChatGUID string `json:"chat_guid"`
 	Identifier   `json:"-"`
 	DisplayName  string   `json:"title"`
 	Members      []string `json:"members"`
 	NoCreateRoom bool     `json:"no_create_room"`
+	ThreadID     string   `json:"thread_id,omitempty"`
+	Delete       bool     `json:"delete,omitempty"`
 }
 
 type Identifier struct {
@@ -199,6 +228,9 @@ type Identifier struct {
 }
 
 func ParseIdentifier(guid string) Identifier {
+	if len(guid) == 0 {
+		return Identifier{}
+	}
 	parts := strings.Split(guid, ";")
 	return Identifier{
 		Service: parts[0],
@@ -220,8 +252,15 @@ func (id Identifier) String() string {
 
 type SendResponse struct {
 	GUID     string    `json:"guid"`
+	Service  string    `json:"service"`
+	ChatGUID string    `json:"chat_guid"`
 	Time     time.Time `json:"-"`
 	UnixTime float64   `json:"timestamp"`
+}
+
+type CreateGroupResponse struct {
+	GUID     string `json:"guid"`
+	ThreadID string `json:"thread_id"`
 }
 
 type ConnectorCapabilities struct {
@@ -230,8 +269,14 @@ type ConnectorCapabilities struct {
 	SendReadReceipts         bool
 	SendTypingNotifications  bool
 	SendCaptions             bool
+	UnsendMessages           bool
+	EditMessages             bool
 	BridgeState              bool
 	MessageStatusCheckpoints bool
+	DeliveredStatus          bool
+	ContactChatMerging       bool
+	RichLinks                bool
+	ChatBridgeResult         bool
 }
 
 type PushKeyRequest struct {
@@ -248,6 +293,64 @@ type SendMessageStatus struct {
 	GUID       string `json:"guid"`
 	ChatGUID   string `json:"chat_guid"`
 	Status     string `json:"status"`
+	Service    string `json:"service"`
 	Message    string `json:"message,omitempty"`
 	StatusCode string `json:"status_code,omitempty"`
+}
+
+type BackfillTask struct {
+	ChatGUID   string     `json:"chat_guid"`
+	Messages   []*Message `json:"messages"`
+	BackfillID string     `json:"backfill_id"`
+}
+
+type StartupSyncHookResponse struct {
+	SkipSync bool `json:"skip_sync"`
+}
+
+type RichLinkAsset struct {
+	MimeType          string               `json:"mimeType,omitempty"`
+	AccessibilityText string               `json:"accessibilityText,omitempty"`
+	Source            *RichLinkAssetSource `json:"source,omitempty"`
+	OriginalURL       string               `json:"originalURL,omitempty"`
+	Size              *RichLinkAssetSize   `json:"size,omitempty"`
+}
+
+type RichLinkAssetSource struct {
+	URL  string `json:"url,omitempty"`
+	Data []byte `json:"data,omitempty"`
+}
+
+type RichLinkAssetSize struct {
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+type RichLinkVideoAsset struct {
+	HasAudio     bool          `json:"hasAudio,omitempty"`
+	YouTubeURL   string        `json:"youTubeURL,omitempty"`
+	StreamingURL string        `json:"streamingURL,omitempty"`
+	Asset        RichLinkAsset `json:"asset"`
+}
+
+type RichLink struct {
+	OriginalURL            string              `json:"originalURL,omitempty"`
+	URL                    string              `json:"URL,omitempty"`
+	Title                  string              `json:"title,omitempty"`
+	Summary                string              `json:"summary,omitempty"`
+	SelectedText           string              `json:"selectedText,omitempty"`
+	SiteName               string              `json:"siteName,omitempty"`
+	RelatedURL             string              `json:"relatedURL,omitempty"`
+	Creator                string              `json:"creator,omitempty"`
+	CreatorFacebookProfile string              `json:"creatorFacebookProfile,omitempty"`
+	CreatorTwitterUsername string              `json:"creatorTwitterUsername,omitempty"`
+	ItemType               string              `json:"itemType,omitempty"`
+	Icon                   *RichLinkAsset      `json:"icon,omitempty"`
+	Image                  *RichLinkAsset      `json:"image,omitempty"`
+	Video                  *RichLinkVideoAsset `json:"video,omitempty"`
+	Audio                  *RichLinkAsset      `json:"audio,omitempty"`
+	Images                 []RichLinkAsset     `json:"images,omitempty"`
+	Videos                 []RichLinkAsset     `json:"videos,omitempty"`
+	StreamingVideos        []RichLinkAsset     `json:"streamingVideos,omitempty"`
+	Audios                 []RichLinkAsset     `json:"audios,omitempty"`
 }

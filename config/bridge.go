@@ -22,9 +22,16 @@ import (
 	"strings"
 	"text/template"
 
+	"maunium.net/go/mautrix/bridge/bridgeconfig"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
+
+type DeferredConfig struct {
+	StartDaysAgo   int `yaml:"start_days_ago"`
+	MaxBatchEvents int `yaml:"max_batch_events"`
+	BatchDelay     int `yaml:"batch_delay"`
+}
 
 type BridgeConfig struct {
 	User id.UserID `yaml:"user"`
@@ -38,66 +45,89 @@ type BridgeConfig struct {
 	MessageStatusEvents bool `yaml:"message_status_events"`
 	SendErrorNotices    bool `yaml:"send_error_notices"`
 
-	MaxHandleSeconds int `yaml:"max_handle_seconds"`
+	MaxHandleSeconds int    `yaml:"max_handle_seconds"`
+	DeviceID         string `yaml:"device_id"`
 
-	SyncWithCustomPuppets bool    `yaml:"sync_with_custom_puppets"`
-	SyncDirectChatList    bool    `yaml:"sync_direct_chat_list"`
-	LoginSharedSecret     string  `yaml:"login_shared_secret"`
-	DoublePuppetServerURL string  `yaml:"double_puppet_server_url"`
-	ChatSyncMaxAge        float64 `yaml:"chat_sync_max_age"`
-	InitialBackfillLimit  int     `yaml:"initial_backfill_limit"`
-	BackfillDisableNotifs bool    `yaml:"initial_backfill_disable_notifications"`
-	PeriodicSync          bool    `yaml:"periodic_sync"`
-	FindPortalsIfEmpty    bool    `yaml:"find_portals_if_db_empty"`
-	MediaViewerURL        string  `yaml:"media_viewer_url"`
-	MediaViewerSMSMinSize int     `yaml:"media_viewer_sms_min_size"`
-	MediaViewerIMMinSize  int     `yaml:"media_viewer_imessage_min_size"`
-	ConvertHEIF           bool    `yaml:"convert_heif"`
-	ConvertVideo          struct {
+	SyncDirectChatList    bool   `yaml:"sync_direct_chat_list"`
+	LoginSharedSecret     string `yaml:"login_shared_secret"`
+	DoublePuppetServerURL string `yaml:"double_puppet_server_url"`
+	Backfill              struct {
+		Enable               bool    `yaml:"enable"`
+		OnlyBackfill         bool    `yaml:"only_backfill"`
+		InitialLimit         int     `yaml:"initial_limit"`
+		InitialSyncMaxAge    float64 `yaml:"initial_sync_max_age"`
+		UnreadHoursThreshold int     `yaml:"unread_hours_threshold"`
+		Immediate            struct {
+			MaxEvents int `yaml:"max_events"`
+		} `yaml:"immediate"`
+
+		Deferred []DeferredConfig `yaml:"deferred"`
+	} `yaml:"backfill"`
+	PeriodicSync       bool `yaml:"periodic_sync"`
+	FindPortalsIfEmpty bool `yaml:"find_portals_if_db_empty"`
+	MediaViewer        struct {
+		URL        string `yaml:"url"`
+		Homeserver string `yaml:"homeserver"`
+		SMSMinSize int    `yaml:"sms_min_size"`
+		IMMinSize  int    `yaml:"imessage_min_size"`
+		Template   string `yaml:"template"`
+	} `yaml:"media_viewer"`
+	ConvertHEIF  bool `yaml:"convert_heif"`
+	ConvertTIFF  bool `yaml:"convert_tiff"`
+	ConvertVideo struct {
 		Enabled    bool     `yaml:"enabled"`
 		FFMPEGArgs []string `yaml:"ffmpeg_args"`
 		MimeType   string   `yaml:"mime_type"`
 		Extension  string   `yaml:"extension"`
 	} `yaml:"convert_video"`
+	CommandPrefix          string `yaml:"command_prefix"`
+	ForceUniformDMSenders  bool   `yaml:"force_uniform_dm_senders"`
+	DisableSMSPortals      bool   `yaml:"disable_sms_portals"`
+	RerouteSMSGroupReplies bool   `yaml:"reroute_mms_group_replies"`
+	FederateRooms          bool   `yaml:"federate_rooms"`
+	CaptionInMessage       bool   `yaml:"caption_in_message"`
+	PrivateChatPortalMeta  string `yaml:"private_chat_portal_meta"`
 
-	FederateRooms bool `yaml:"federate_rooms"`
-
-	CommandPrefix string `yaml:"command_prefix"`
-
-	Encryption struct {
-		Allow   bool `yaml:"allow"`
-		Default bool `yaml:"default"`
-
-		Appservice bool `yaml:"appservice"`
-
-		KeySharing struct {
-			Allow               bool `yaml:"allow"`
-			RequireCrossSigning bool `yaml:"require_cross_signing"`
-			RequireVerification bool `yaml:"require_verification"`
-		} `yaml:"key_sharing"`
-	} `yaml:"encryption"`
+	Encryption bridgeconfig.EncryptionConfig `yaml:"encryption"`
 
 	Relay RelayConfig `yaml:"relay"`
 
 	usernameTemplate    *template.Template `yaml:"-"`
 	displaynameTemplate *template.Template `yaml:"-"`
 	communityTemplate   *template.Template `yaml:"-"`
-
-	OldMediaViewerMinSize  int  `yaml:"media_viewer_min_size"`
-	OldMessageStatusEvents bool `yaml:"send_message_send_status_events"`
 }
 
-func (bc *BridgeConfig) setDefaults() {
-	bc.DeliveryReceipts = false
-	bc.SyncWithCustomPuppets = false
-	bc.LoginSharedSecret = ""
-	bc.ChatSyncMaxAge = 0.5
-	bc.InitialBackfillLimit = 100
-	bc.BackfillDisableNotifs = true
-	bc.PeriodicSync = true
-	bc.FederateRooms = true
-	bc.MediaViewerSMSMinSize = 400 * 1024
-	bc.MediaViewerIMMinSize = 50 * 1024 * 1024
+func (bc BridgeConfig) GetResendBridgeInfo() bool {
+	return false
+}
+
+func (bc BridgeConfig) GetManagementRoomTexts() bridgeconfig.ManagementRoomTexts {
+	return bridgeconfig.ManagementRoomTexts{
+		Welcome:            "Hello, I'm an iMessage bridge bot.",
+		WelcomeConnected:   "Use `help` for help.",
+		WelcomeUnconnected: "",
+		AdditionalHelp:     "",
+	}
+}
+
+func (bc BridgeConfig) Validate() error {
+	return nil
+}
+
+func (bc BridgeConfig) GetEncryptionConfig() bridgeconfig.EncryptionConfig {
+	return bc.Encryption
+}
+
+func (bc BridgeConfig) EnableMessageStatusEvents() bool {
+	return bc.MessageStatusEvents
+}
+
+func (bc BridgeConfig) EnableMessageErrorNotices() bool {
+	return bc.SendErrorNotices
+}
+
+func (bc BridgeConfig) GetCommandPrefix() string {
+	return bc.CommandPrefix
 }
 
 type umBridgeConfig BridgeConfig
@@ -118,13 +148,6 @@ func (bc *BridgeConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
-	if bc.OldMediaViewerMinSize > 0 {
-		bc.MediaViewerSMSMinSize = bc.OldMediaViewerMinSize
-	}
-	if bc.OldMessageStatusEvents {
-		bc.MessageStatusEvents = true
-	}
-
 	return nil
 }
 
@@ -143,7 +166,7 @@ func (bc BridgeConfig) FormatUsername(username string) string {
 		if _, err := strconv.Atoi(username[1:]); err == nil {
 			username = username[1:]
 		}
-	} else if username != "(.+)" && username != ".+" {
+	} else {
 		username = id.EncodeUserLocalpart(username)
 	}
 	var buf bytes.Buffer
