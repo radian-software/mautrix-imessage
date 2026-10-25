@@ -102,10 +102,11 @@ func (user *User) loginWithSharedSecret() error {
 }
 
 func (user *User) newDoublePuppetIntent() (*appservice.IntentAPI, error) {
-	client, err := user.bridge.AS.NewExternalMautrixClient(user.MXID, user.AccessToken, user.bridge.Config.Bridge.DoublePuppetServerURL)
+	client, err := user.bridge.AS.NewExternalMautrixClient(user.MXID, user.bridge.Config.AppService.ASToken, user.bridge.Config.Bridge.DoublePuppetServerURL)
 	if err != nil {
 		return nil, err
 	}
+	client.SetAppServiceUserID = true
 
 	ia := user.bridge.AS.NewIntentAPI("custom")
 	ia.Client = client
