@@ -46,6 +46,7 @@ const (
 	IncomingPushKey            ipc.Command = "push_key"
 	IncomingSendMessageStatus  ipc.Command = "send_message_status"
 	IncomingBackfillTask       ipc.Command = "backfill"
+	IncomingNetworkChange      ipc.Command = "network_change"
 )
 
 func floatToTime(unix float64) (time.Time, bool) {
@@ -143,6 +144,7 @@ func (ios *iOSConnector) Start(readyCallback func()) error {
 	ios.IPC.SetHandler(IncomingPushKey, ios.handlePushKey)
 	ios.IPC.SetHandler(IncomingSendMessageStatus, ios.handleIncomingSendMessageStatus)
 	ios.IPC.SetHandler(IncomingBackfillTask, ios.handleIncomingBackfillTask)
+	ios.IPC.SetHandler(IncomingNetworkChange, ios.handleIncomingNetworkChange)
 	readyCallback()
 	return nil
 }
@@ -379,6 +381,12 @@ func (ios *iOSConnector) handleIncomingBackfillTask(data json.RawMessage) interf
 	default:
 		ios.log.Warnln("Incoming backfill task buffer is full")
 	}
+	return nil
+}
+
+func (ios *iOSConnector) handleIncomingNetworkChange(data json.RawMessage) interface{} {
+	ios.log.Infoln("Notified about network change by wrapper app")
+	ios.bridge.HandleNetworkChange()
 	return nil
 }
 
