@@ -32,6 +32,7 @@ import (
 	"maunium.net/go/maulogger/v2"
 
 	"maunium.net/go/mautrix/bridge/bridgeconfig"
+	"maunium.net/go/mautrix/exsync"
 
 	"maunium.net/go/mautrix/event"
 
@@ -680,6 +681,10 @@ func (br *IMBridge) HandleFlags() bool {
 	return false
 }
 
+func (br *IMBridge) HandleNetworkChange() {
+	br.NetworkChangeEvent.Notify()
+}
+
 func main() {
 	br := &IMBridge{
 		portalsByMXID: make(map[id.RoomID]*Portal),
@@ -707,6 +712,8 @@ func main() {
 		},
 
 		Child: br,
+
+		NetworkChangeEvent: exsync.NewEvent(),
 	}
 	br.InitVersion(Tag, Commit, BuildTime)
 

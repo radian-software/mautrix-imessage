@@ -132,6 +132,7 @@ type Bridge interface {
 	ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool
 	GetMessagesSince(chatGUID string, since time.Time) []string
 	SetPushKey(req *PushKeyRequest)
+	HandleNetworkChange()
 }
 
 var AppleEpoch = time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
